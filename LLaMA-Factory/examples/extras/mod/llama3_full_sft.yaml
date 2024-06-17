@@ -1,5 +1,5 @@
 # model
-model_name_or_path: /home/yifei/zkli/MoD/llama/7b-hf
+model_name_or_path: /root/jt/projects/llama/llama-2-7b-hf
 
 # method
 stage: sft

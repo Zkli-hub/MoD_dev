@@ -17,7 +17,6 @@ if TYPE_CHECKING:
 
 def load_mod_pretrained_model(**init_kwargs) -> "PreTrainedModel":
     from MoD import AutoMoDModelForCausalLM
-
     return AutoMoDModelForCausalLM.from_pretrained(**init_kwargs)
 
 
