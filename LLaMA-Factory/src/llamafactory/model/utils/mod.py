@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 
 def load_mod_pretrained_model(**init_kwargs) -> "PreTrainedModel":
     from MoD import AutoMoDModelForCausalLM
+
     return AutoMoDModelForCausalLM.from_pretrained(**init_kwargs)
 
 
@@ -1096,8 +1097,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         causal_mask = torch.full((sequence_length, target_length), fill_value=min_dtype, dtype=dtype, device=device)
         if sequence_length != 1:
-            # causal_mask = torch.triu(causal_mask, diagonal=1)
-            causal_mask = causal_mask.to(causal_mask.device, dtype=torch.bfloat16)
+            causal_mask = torch.triu(causal_mask, diagonal=1)
         causal_mask *= torch.arange(target_length, device=device) > cache_position.reshape(-1, 1)
         causal_mask = causal_mask[None, None, :, :].expand(input_tensor.shape[0], 1, -1, -1)
         if attention_mask is not None:
@@ -1576,14 +1576,20 @@ class LlamaMoDForQuestionAnswering(LlamaPreTrainedModel):
 class TokenRouter(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
-        # self.weight_predictor = nn.Linear(embed_dim, 1, bias = False)
+        # self.weight_predictor = nn.Sequential(
+        #     nn.Linear(embed_dim, embed_dim // 2),
+        #     nn.ReLU(),
+        #     # nn.Linear(embed_dim // 2, embed_dim // 4, bias = False),
+        #     # nn.SiLU(),
+        #     nn.Linear(embed_dim // 2, 1),
+        #     nn.Sigmoid()
+        # )
+        
         self.weight_predictor = nn.Linear(embed_dim, 1)
 
     def forward(self, x):
-        weights = self.weight_predictor(x).squeeze(
-            -1
-        )  # [batch_size, seq_len]
-        weights = torch.sigmoid(weights)
+        weights = self.weight_predictor(x).squeeze(-1)  # [batch_size, seq_len]
+        #weights = torch.sigmoid(weights)
         return weights
     
 import torch
@@ -1595,10 +1601,14 @@ class MoD(nn.Module):
         super(MoD, self).__init__()
         self.router = TokenRouter(block.hidden_size)
         self.block = block  # Original decoder layer
-        self.capacity = random.choice([1.0, 0.75])
-        #self.capacity = random.choice([1.0, 0.75, 0.5, 0.25])
+        self.capacity = 1
+        #self.mode = "largest"
+        self.capacity_candidates = [0.9, 0.8 ,0.7 ,0.6 ,0.5 ,0.4 ,0.3 ,0.2]
         self.training_step = 0
 
+    def set_mode(self, mode):
+        self.mode = mode
+        
     def forward(self, 
                 hidden_states: torch.Tensor, 
                 attention_mask: Optional[torch.Tensor] = None, 
@@ -1610,14 +1620,12 @@ class MoD(nn.Module):
                 **kwargs) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         
         b, s, d = hidden_states.shape
-        print(hidden_states.shape)
         weights = self.router(hidden_states)
-        self.capacity = 0.75
-        # self.capacity = random.choice([1.0, 0.75])
         if self.router.training:
-            temp_capacity = self.capacity
-            self.training_step += 1 if self.training_step < 1000 else 999
-            self.capacity = temp_capacity + ((1 - temp_capacity) * (1. / self.training_step))
+            temp_capacity = random.choice([1.0,0.9, 0.8])
+            self.capacity = temp_capacity + ((1 - temp_capacity) * (1 / (self.training_step+1)))
+        else:
+            self.capacity = random.choice([1.0,0.9, 0.8])
 
         k = int(self.capacity * s)
         if k == 0: k = 1
@@ -1654,10 +1662,7 @@ class MoD(nn.Module):
                         processed_tokens[i][selected_mask[i]], cache = block_output
                     else:
                         processed_tokens[i][selected_mask[i]] = block_output[0]
-                    # print(f"processed_tokens[i][selected_mask[i]]_before: {processed_tokens[i][selected_mask[i]].shape}")
-                    processed_tokens[i][selected_mask[i]] = processed_tokens[i][selected_mask[i]] * weights[i][selected_mask[i]].unsqueeze(-1)
-                    # print(f"processed_tokens[i][selected_mask[i]]: {processed_tokens[i][selected_mask[i]].shape}")
-                    # print(f"weights[i][selected_mask[i]].unsqueeze(-1): {weights[i][selected_mask[i]].unsqueeze(-1).shape}")
+                    #processed_tokens[i][selected_mask[i]] = processed_tokens[i][selected_mask[i]] * weights[i][selected_mask[i]].unsqueeze(-1)
                 else:
                     processed_tokens[i][selected_mask[i]] = self.block(
                         selected_tokens.unsqueeze(0),
@@ -1667,39 +1672,30 @@ class MoD(nn.Module):
                         output_attentions=output_attentions,
                         use_cache=use_cache,
                         **kwargs
-                    )[0] * weights[i][selected_mask[i]].unsqueeze(-1)
+                    )[0]
         
-        out = processed_tokens + (hidden_states * (~selected_mask).unsqueeze(-1).to(hidden_states.dtype))
-        out = (out, cache) if cache is not None else (out,)
-        
-        # print(f"len(block_output): {len(block_output)}")
-        # print(f"processed_tokens: {processed_tokens.shape}")
-        # print(f"hidden_states.shape: {hidden_states.shape}")
-        # print(f"selected_tokens: {selected_tokens.shape}")
-        # print(f"weights: {weights.shape}")
-        # print(f"k: {k}")
-        # print(f"self.capacity: {self.capacity}")
-        # print(f"threshold: {threshold}")
-        # print(f"selected_mask: {selected_mask}")
-        # print(f"attention_mask: {attention_mask.shape}")
-        # print(f"current_causal_mask: {current_causal_mask.shape}")
-        # print(f"position_ids: {position_ids}")
-        # print(f"selected_position_ids: {selected_position_ids}")
-        # print(f"output_attentions: {output_attentions}")
-        # print(f"use_caches: {use_cache}")
-        # print(f"cache_position: {cache_position}")
-        # print(f"past_key_value: {past_key_value}")
-        
-        # outputs = self.block(
-        #     hidden_states=hidden_states,
-        #     attention_mask=attention_mask,
-        #     position_ids=position_ids,
-        #     past_key_value=past_key_value,
-        #     output_attentions=output_attentions,
-        #     use_cache=use_cache,
-        #     cache_position=cache_position,
-        # )
-
+            output_hidden_states = torch.zeros_like(hidden_states)
+        for i in range(b):
+            output_hidden_states[i][selected_mask[i]] = processed_tokens[i][selected_mask[i]]
+            output_hidden_states[i][~selected_mask[i]] = hidden_states[i][~selected_mask[i]]
+        out = (output_hidden_states, cache) if cache is not None else (output_hidden_states,)
+        #print(f"len(block_output): {len(block_output)}")
+        #print(f"processed_tokens: {processed_tokens.shape}")
+        #print(f"hidden_states.shape: {hidden_states.shape}")
+        #print(f"selected_tokens: {selected_tokens.shape}")
+        #print(f"weights: {weights.shape}")
+        #print(f"k: {k}")
+        #print(f"self.capacity: {self.capacity}")
+        #print(f"threshold: {threshold}")
+        #print(f"selected_mask: {selected_mask}")
+        #print(f"attention_mask: {attention_mask.shape}")
+        #print(f"current_causal_mask: {current_causal_mask.shape}")
+        #print(f"position_ids: {position_ids}")
+        #print(f"selected_position_ids: {selected_position_ids}")
+        #print(f"output_attentions: {output_attentions}")
+        #print(f"use_caches: {use_cache}")
+        #print(f"cache_position: {cache_position}")
+        #print(f"past_key_value: {past_key_value}")
         return out
 
 
