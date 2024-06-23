@@ -21,3 +21,11 @@ Define your own model modes in /LLaMA-Factory/src/llamafactory/model/utils/mod.p
 Prepare your own pretrained model in HF format
 
 Check the notebook Mixture-of-depths/MoD/modeling/models/llama_mod_debug copy.ipynb
+
+## Eval
+
+- llama2-7b MMLU Evaluation
+
+```
+CUDA_VISIBLE_DEVICES=0 llamafactory-cli eval --model_name_or_path PATH --template fewshot --task mmlu --split test --lang en --n_shot 5 --batch_size 1
+```
