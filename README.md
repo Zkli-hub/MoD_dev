@@ -27,5 +27,11 @@ Check the notebook Mixture-of-depths/MoD/modeling/models/llama_mod_debug copy.ip
 - llama2-7b MMLU Evaluation
 
 ```
-CUDA_VISIBLE_DEVICES=0 llamafactory-cli eval --model_name_or_path PATH --template fewshot --task mmlu --split test --lang en --n_shot 5 --batch_size 1
+CUDA_VISIBLE_DEVICES=0 llamafactory-cli eval ./LLaMA-Factory/examples/extras/mod/base_eval.yaml
+```
+
+- llama_MoD MMLU Evaluation
+
+```
+CUDA_VISIBLE_DEVICES=0 llamafactory-cli eval ./LLaMA-Factory/examples/extras/mod/mod_eval.yaml
 ```
