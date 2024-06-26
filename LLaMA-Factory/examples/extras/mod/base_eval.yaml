@@ -1,0 +1,14 @@
+#model
+model_name_or_path: /home/yifei/zkli/MoD/llama/7b-hf
+
+
+#method
+#mixture_of_depths: load
+
+#task
+template: fewshot
+task: mmlu
+split: test
+lang: en
+n_shot: 5
+batch_size: 1

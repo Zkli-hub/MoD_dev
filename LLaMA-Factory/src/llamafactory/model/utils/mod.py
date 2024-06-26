@@ -10,22 +10,14 @@ from transformers import PreTrainedModel
 
 
 if TYPE_CHECKING:
-    from transformers import PretrainedConfig, PreTrainedModel
+    from transformers import PretrainedConfig, PreTrainedModelc
 
     from ...hparams import ModelArguments
-
-
-def load_mod_pretrained_model(**init_kwargs) -> "PreTrainedModel":
-    from MoD import AutoMoDModelForCausalLM
-
-    return AutoMoDModelForCausalLM.from_pretrained(**init_kwargs)
-
-
+    
 def convert_pretrained_model_to_mod(
     model: "PreTrainedModel", config: "PretrainedConfig", model_args: "ModelArguments"
 ) -> "PreTrainedModel":
     from MoD import apply_mod_to_hf
-
     if getattr(config, "model_type", None) not in MOD_SUPPORTED_MODELS:
         raise ValueError("Current model is not supported by mixture-of-depth.")
 
@@ -937,8 +929,12 @@ class LlamaModel(LlamaPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [MoD(0.125, LlamaDecoderLayer(config, layer_idx)) for layer_idx in range(config.num_hidden_layers)]
+            [LlamaDecoderLayer(config, layer_idx) if (layer_idx < 16 or layer_idx % 2 == 0) else MoD(0.75, LlamaDecoderLayer(config, layer_idx)) for layer_idx in range(config.num_hidden_layers)]
         )
+
+        # self.layers = nn.ModuleList(
+        #     [MoD(0.125, LlamaDecoderLayer(config, layer_idx)) for layer_idx in range(config.num_hidden_layers)]
+        # )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
         self.mode = "smallest"
@@ -1576,16 +1572,16 @@ class LlamaMoDForQuestionAnswering(LlamaPreTrainedModel):
 class TokenRouter(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
-        # self.weight_predictor = nn.Sequential(
-        #     nn.Linear(embed_dim, embed_dim // 2),
-        #     nn.ReLU(),
-        #     # nn.Linear(embed_dim // 2, embed_dim // 4, bias = False),
-        #     # nn.SiLU(),
-        #     nn.Linear(embed_dim // 2, 1),
-        #     nn.Sigmoid()
-        # )
+        self.weight_predictor = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim // 2),
+            #nn.ReLU(),
+            # nn.Linear(embed_dim // 2, embed_dim // 4, bias = False),
+            nn.SiLU(),
+            nn.Linear(embed_dim // 2, 1),
+            #nn.Sigmoid()
+        )
         
-        self.weight_predictor = nn.Linear(embed_dim, 1)
+        #self.weight_predictor = nn.Linear(embed_dim, 1)
 
     def forward(self, x):
         weights = self.weight_predictor(x).squeeze(-1)  # [batch_size, seq_len]
@@ -1601,7 +1597,7 @@ class MoD(nn.Module):
         super(MoD, self).__init__()
         self.router = TokenRouter(block.hidden_size)
         self.block = block  # Original decoder layer
-        self.capacity = 1
+        self.capacity = capacity
         #self.mode = "largest"
         self.capacity_candidates = [0.9, 0.8 ,0.7 ,0.6 ,0.5 ,0.4 ,0.3 ,0.2]
         self.training_step = 0
@@ -1621,13 +1617,18 @@ class MoD(nn.Module):
         
         b, s, d = hidden_states.shape
         weights = self.router(hidden_states)
+        temp_capacity = self.capacity
         if self.router.training:
-            temp_capacity = random.choice([1.0,0.9, 0.8])
-            self.capacity = temp_capacity + ((1 - temp_capacity) * (1 / (self.training_step+1)))
+            self.training_step += 1
+            #temp_capacity = 0.95
+            temp_capacity = self.capacity + ((1 - self.capacity) * (1 / (self.training_step)))
         else:
-            self.capacity = random.choice([1.0,0.9, 0.8])
+            temp_capacity = self.capacity
 
-        k = int(self.capacity * s)
+        num = int(temp_capacity * s) + 1
+        if num <= s: 
+            k = num
+        else: k = int(temp_capacity * s)
         if k == 0: k = 1
         top_k_values, _ = torch.topk(weights, k, dim=1, sorted=True)
         threshold = top_k_values[:, -1]
@@ -1715,10 +1716,10 @@ def apply_mod_to_llama(model: PreTrainedModel, config, enabled: bool = True) -> 
             #print(parts)
             try:
                 layer_idx = int(parts[2])
-                if layer_idx % 1 == 0:
+                if layer_idx < 16 or layer_idx % 2 ==0:
                 #     # Even layers, directly copy
-                #     modified_state_dict[name] = param
-                # else:
+                    modified_state_dict[name] = param
+                else:
                     # Odd layers, map to block within MoD
                     new_name = name.replace(f'layers.{layer_idx}', f'layers.{layer_idx}.block')
                     if new_name in modified_state_dict:
@@ -1742,3 +1743,10 @@ def convert_pretrained_llama_to_mod(
     model = apply_mod_to_llama(model, config)
     model = model.to(model_args.compute_dtype)
     return model
+
+
+def load_mod_pretrained_model(**init_kwargs) -> "PreTrainedModel":
+    #from MoD import AutoMoDModelForCausalLMc
+    print("Loading MoD model.")
+    
+    return LlamaMoDForCausalLM.from_pretrained(**init_kwargs)
