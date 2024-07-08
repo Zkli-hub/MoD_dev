@@ -7,6 +7,7 @@ import torch.nn as nn
 from typing import Optional, Tuple, Any
 import random
 from transformers import PreTrainedModel
+import time
 
 
 if TYPE_CHECKING:
@@ -701,7 +702,7 @@ class LlamaDecoderLayer(nn.Module):
     def __init__(self, config: LlamaConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-
+        self.layer_idx = layer_idx
         self.self_attn = LLAMA_ATTENTION_CLASSES[config._attn_implementation](config=config, layer_idx=layer_idx)
 
         self.mlp = LlamaMLP(config)
@@ -929,15 +930,32 @@ class LlamaModel(LlamaPreTrainedModel):
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [LlamaDecoderLayer(config, layer_idx) if (layer_idx < 16 or layer_idx % 2 == 0) else MoD(0.75, LlamaDecoderLayer(config, layer_idx)) for layer_idx in range(config.num_hidden_layers)]
+            [LlamaDecoderLayer(config, layer_idx) if (layer_idx < 16 or layer_idx % 2 ==0) else MoD(0.2, LlamaDecoderLayer(config, layer_idx)) for layer_idx in range(config.num_hidden_layers)]
         )
-
         # self.layers = nn.ModuleList(
-        #     [MoD(0.125, LlamaDecoderLayer(config, layer_idx)) for layer_idx in range(config.num_hidden_layers)]
+        #     [LlamaDecoderLayer(config, layer_idx) if (layer_idx < 16) 
+        #     else MoD(0.125, LlamaDecoderLayer(config, layer_idx)) if layer_idx % 2 == 0 
+        #     else MoD(0.9, LlamaDecoderLayer(config, layer_idx))
+        #     for layer_idx in range(config.num_hidden_layers)]
+        # )
+        # self.layers = nn.ModuleList(
+        #     [MoD(1.0, LlamaDecoderLayer(config, layer_idx)) for layer_idx in range(config.num_hidden_layers)]
+        # )
+        # self.layers = nn.ModuleList(
+        #     [MoD(0.3947, LlamaDecoderLayer(config, layer_idx)) if layer_idx == 31
+        #     else MoD(0.2303, LlamaDecoderLayer(config, layer_idx)) if layer_idx == 17
+        #     else MoD(0.2020, LlamaDecoderLayer(config, layer_idx)) if layer_idx == 19
+        #     else MoD(0.1783, LlamaDecoderLayer(config, layer_idx)) if layer_idx == 21
+        #     else MoD(0.1579, LlamaDecoderLayer(config, layer_idx)) if layer_idx == 23
+        #     else MoD(0.1413, LlamaDecoderLayer(config, layer_idx)) if layer_idx == 25
+        #     else MoD(0.1438, LlamaDecoderLayer(config, layer_idx)) if layer_idx == 27
+        #     else MoD(0.1518, LlamaDecoderLayer(config, layer_idx)) if layer_idx == 29
+        #     else LlamaDecoderLayer(config, layer_idx)
+        #     for layer_idx in range(config.num_hidden_layers)]
         # )
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.gradient_checkpointing = False
-        self.mode = "smallest"
+        self.mode = "largest"
 
         # Initialize weights and apply final processing
         self.post_init()
@@ -1136,7 +1154,7 @@ class LlamaMoDForCausalLM(LlamaPreTrainedModel):
         self.model = LlamaModel(config)
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.mode = "smallest"
+        self.mode = "largest"
         # Initialize weights and apply final processing
         self.post_init()
 
@@ -1572,25 +1590,31 @@ class LlamaMoDForQuestionAnswering(LlamaPreTrainedModel):
 class TokenRouter(nn.Module):
     def __init__(self, embed_dim):
         super().__init__()
-        self.weight_predictor = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim // 2),
-            #nn.ReLU(),
-            # nn.Linear(embed_dim // 2, embed_dim // 4, bias = False),
-            nn.SiLU(),
-            nn.Linear(embed_dim // 2, 1),
-            #nn.Sigmoid()
-        )
-        
-        #self.weight_predictor = nn.Linear(embed_dim, 1)
+        # self.weight_predictor = nn.Sequential(
+        #     nn.Linear(embed_dim, embed_dim // 2),
+        #     #nn.ReLU(),
+        #     # nn.Linear(embed_dim // 2, embed_dim // 4, bias = False),
+        #     nn.SiLU(),
+        #     nn.Linear(embed_dim // 2, 1),
+        #     #nn.Sigmoid()
+        # )
+        self.weight_predictor = nn.Linear(embed_dim, 1)
+        torch.nn.init.xavier_uniform_(self.weight_predictor.weight)
+        if self.weight_predictor.bias is not None:
+            nn.init.zeros_(self.weight_predictor.bias)
+        self.ac = nn.Sigmoid()
+        self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
+        x = self.norm(x)
         weights = self.weight_predictor(x).squeeze(-1)  # [batch_size, seq_len]
-        #weights = torch.sigmoid(weights)
+        weights = self.ac(weights)
         return weights
     
 import torch
 import torch.nn as nn
 from typing import Optional, Tuple
+import numpy as np
 
 class MoD(nn.Module):
     def __init__(self, capacity, block: nn.Module):
@@ -1598,12 +1622,16 @@ class MoD(nn.Module):
         self.router = TokenRouter(block.hidden_size)
         self.block = block  # Original decoder layer
         self.capacity = capacity
-        #self.mode = "largest"
+        self.mode = "largest"
         self.capacity_candidates = [0.9, 0.8 ,0.7 ,0.6 ,0.5 ,0.4 ,0.3 ,0.2]
         self.training_step = 0
+        #self.router = nn.Linear(block.hidden_size, 1)
 
     def set_mode(self, mode):
         self.mode = mode
+        
+    def set_capacity(self, capacity):
+        self.capacity = capacity
         
     def forward(self, 
                 hidden_states: torch.Tensor, 
@@ -1616,12 +1644,31 @@ class MoD(nn.Module):
                 **kwargs) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         
         b, s, d = hidden_states.shape
+        layer_idx = self.block.layer_idx
         weights = self.router(hidden_states)
+        if torch.isnan(weights).any():
+            print("NaN detected in output of linear layer")
         temp_capacity = self.capacity
+        current_capacity = 1
         if self.router.training:
+            
             self.training_step += 1
-            #temp_capacity = 0.95
-            temp_capacity = self.capacity + ((1 - self.capacity) * (1 / (self.training_step)))
+            # if self.mode == "largest":
+            #     current_capacity = 1
+            # if self.mode == "smallest":
+            #     if layer_idx < 8: current_capacity = 1
+            #     elif layer_idx < 16: current_capacity = 0.75
+            #     elif layer_idx < 24: current_capacity = 0.5
+            #     elif layer_idx < 32: current_capacity = 0.25
+            # if self.mode == "random":
+            #     if layer_idx < 8: current_capacity = 1
+            #     elif layer_idx < 16: current_capacity = random.choice(np.arange(0.8, 1.00, 0.05))
+            #     elif layer_idx < 24: current_capacity = random.choice(np.arange(0.55, 1.00, 0.05))
+            #     elif layer_idx < 32: current_capacity = random.choice(np.arange(0.3, 1.00, 0.05))
+            current_capacity = self.capacity
+            temp_capacity = current_capacity + ((1 - current_capacity) * (1 / (self.training_step)))
+            warm_coef = self.training_step / (8 * 336)
+            if warm_coef >=1: warm_coef=1
         else:
             temp_capacity = self.capacity
 
@@ -1629,15 +1676,21 @@ class MoD(nn.Module):
         if num <= s: 
             k = num
         else: k = int(temp_capacity * s)
-        if k == 0: k = 1
+        k = max(k, 1)
         top_k_values, _ = torch.topk(weights, k, dim=1, sorted=True)
         threshold = top_k_values[:, -1]
-        selected_mask = weights >= threshold.unsqueeze(-1) if k > 1 else weights >= threshold.unsqueeze(-1)
-        cache = None
+        selected_mask = (weights >= threshold.unsqueeze(-1) if k > 1 else weights >= threshold.unsqueeze(-1)).float()
         
+        cache = None
+
+        # if layer_idx == 17:
+        #         #print(layer_idx)
+        #         print(self.router.weight_predictor.weight)
+        #         print("Gradients:", self.router.weight_predictor.weight.grad)
+                
         processed_tokens = torch.zeros_like(hidden_states)
         for i in range(b):
-            current_selected_mask = selected_mask[i]
+            current_selected_mask = selected_mask[i].bool()
             selected_tokens = hidden_states[i][current_selected_mask]
             selected_position_ids = position_ids[i][current_selected_mask].unsqueeze(0)
             if attention_mask is not None:
@@ -1648,7 +1701,7 @@ class MoD(nn.Module):
             if selected_tokens.size(0) > 0:
                 # Dynamic cache management
                 if cache_position is not None:
-                    selected_cache_position = cache_position[selected_mask[i]]
+                    selected_cache_position = cache_position[current_selected_mask]
                     block_output = self.block(
                         selected_tokens.unsqueeze(0),
                         attention_mask=current_causal_mask,
@@ -1660,12 +1713,15 @@ class MoD(nn.Module):
                         **kwargs
                     )
                     if len(block_output) == 2:
-                        processed_tokens[i][selected_mask[i]], cache = block_output
+                        processed_tokens[i][current_selected_mask], cache = block_output
                     else:
-                        processed_tokens[i][selected_mask[i]] = block_output[0]
-                    #processed_tokens[i][selected_mask[i]] = processed_tokens[i][selected_mask[i]] * weights[i][selected_mask[i]].unsqueeze(-1)
+                        processed_tokens[i][current_selected_mask] = block_output[0]
+                    if self.router.training:
+                        processed_tokens[i][current_selected_mask] = processed_tokens[i][current_selected_mask] * (1*(1-warm_coef) + warm_coef *weights[i][current_selected_mask].unsqueeze(-1))
+                    else:
+                        processed_tokens[i][current_selected_mask] = processed_tokens[i][current_selected_mask] * (weights[i][current_selected_mask].unsqueeze(-1))
                 else:
-                    processed_tokens[i][selected_mask[i]] = self.block(
+                    processed_tokens[i][current_selected_mask] = self.block(
                         selected_tokens.unsqueeze(0),
                         attention_mask=current_causal_mask,
                         position_ids=selected_position_ids,
@@ -1674,29 +1730,17 @@ class MoD(nn.Module):
                         use_cache=use_cache,
                         **kwargs
                     )[0]
+                    if self.router.training:
+                        processed_tokens[i][current_selected_mask] = processed_tokens[i][current_selected_mask] * (1*(1-warm_coef) + warm_coef *weights[i][current_selected_mask].unsqueeze(-1))
+                    else:
+                        processed_tokens[i][current_selected_mask] = processed_tokens[i][current_selected_mask] * (weights[i][current_selected_mask].unsqueeze(-1))
+
         
             output_hidden_states = torch.zeros_like(hidden_states)
         for i in range(b):
-            output_hidden_states[i][selected_mask[i]] = processed_tokens[i][selected_mask[i]]
-            output_hidden_states[i][~selected_mask[i]] = hidden_states[i][~selected_mask[i]]
+            output_hidden_states[i][selected_mask[i].bool()] = processed_tokens[i][selected_mask[i].bool()]
+            output_hidden_states[i][~selected_mask[i].bool()] = hidden_states[i][~selected_mask[i].bool()]
         out = (output_hidden_states, cache) if cache is not None else (output_hidden_states,)
-        #print(f"len(block_output): {len(block_output)}")
-        #print(f"processed_tokens: {processed_tokens.shape}")
-        #print(f"hidden_states.shape: {hidden_states.shape}")
-        #print(f"selected_tokens: {selected_tokens.shape}")
-        #print(f"weights: {weights.shape}")
-        #print(f"k: {k}")
-        #print(f"self.capacity: {self.capacity}")
-        #print(f"threshold: {threshold}")
-        #print(f"selected_mask: {selected_mask}")
-        #print(f"attention_mask: {attention_mask.shape}")
-        #print(f"current_causal_mask: {current_causal_mask.shape}")
-        #print(f"position_ids: {position_ids}")
-        #print(f"selected_position_ids: {selected_position_ids}")
-        #print(f"output_attentions: {output_attentions}")
-        #print(f"use_caches: {use_cache}")
-        #print(f"cache_position: {cache_position}")
-        #print(f"past_key_value: {past_key_value}")
         return out
 
 
@@ -1716,7 +1760,8 @@ def apply_mod_to_llama(model: PreTrainedModel, config, enabled: bool = True) -> 
             #print(parts)
             try:
                 layer_idx = int(parts[2])
-                if layer_idx < 16 or layer_idx % 2 ==0:
+                #if layer_idx < 0:
+                if layer_idx < 16 or layer_idx % 2 ==0 :
                 #     # Even layers, directly copy
                     modified_state_dict[name] = param
                 else:
