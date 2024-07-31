@@ -1,0 +1,75 @@
+exp_name: sgd_debug_10000_lr1e2_r3
+
+# Fine-tuning arguments
+custom_global_steps: 10000
+batch_size: 1
+epochs: 1
+optimizer:
+  _component_: torch.optim.SGD
+  lr: 0.01
+  momentum: 0.9
+  # _component_: torch.optim.AdamW
+  # lr: 8e-5
+loss:
+  _component_: torch.nn.CrossEntropyLoss
+max_steps_per_epoch: null
+gradient_accumulation_steps: 1
+optimizer_in_bwd: False
+compile: False
+lr_scheduler:
+  _component_: torchtune.modules.get_cosine_schedule_with_warmup
+  num_warmup_steps: 1000
+llm_loss_ratio: 1
+
+# Others.
+device: cuda
+seed: null
+native_llama_path: ./llama-2-7b-hf
+codes_copy_backup:
+  enable: True
+  _code_src_path: ./torchtune/modules/mod_transformer.py
+  _cfg_src_path: ./7B_full_mod.yaml
+
+# Dataset
+dataset:
+  _component_: torchtune.datasets.alpaca_local_dataset
+  data_files: /root/jt/projects/llama_exp/MoD_dev/LLaMA-Factory/data/alpaca_gpt4_data_en.json
+shuffle: False
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.llama2.llama2_tokenizer
+  path: ${native_llama_path}/tokenizer.model
+
+# Logging
+metric_logger:
+  _component_: torchtune.utils.metric_logging.DiskLogger
+  log_dir: ./exps/${exp_name}/logs
+output_dir: ./exps/${exp_name}
+log_every_n_steps: 1
+log_peak_memory_stats: False
+
+# Model Arguments
+model:
+  _component_: torchtune.models.llama2.llama2_7b_mod
+checkpointer:
+  _component_: torchtune.utils.FullModelHFCheckpointer
+  checkpoint_dir: ${native_llama_path}
+  checkpoint_files: [
+    pytorch_model-00001-of-00002.bin,
+    pytorch_model-00002-of-00002.bin
+  ]
+  adapter_checkpoint: null
+  recipe_checkpoint: null
+  output_dir: ./exps/${exp_name}/weights
+  model_type: LLAMA2
+resume_from_checkpoint: False
+
+# Memory management
+enable_activation_checkpointing: True
+memory_efficient_fsdp_wrap: False
+
+# Reduced precision
+dtype: bf16
+
+
