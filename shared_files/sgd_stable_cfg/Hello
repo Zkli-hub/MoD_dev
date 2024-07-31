@@ -1,1 +1,2 @@
 
+分别对应三个文件：mod_transformer.py, 7B_full_mod.yaml（参考这个文件的SGD超参）, recipes/full_finetune_single_device.py(注释掉了EMA)
