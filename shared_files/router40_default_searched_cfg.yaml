@@ -1,0 +1,153 @@
+exp_name: router40_default_searched
+
+# Fine-tuning arguments
+debug_mode: False
+distillation_mode: True
+custom_global_steps: 10000
+batch_size: 1
+epochs: 1
+optimizer:
+  _component_: torch.optim.AdamW
+  lr: 1e-4
+loss:
+  _component_: torch.nn.CrossEntropyLoss
+max_steps_per_epoch: 10000
+gradient_accumulation_steps: 1
+# if enable `lr_scheduler`, `optimizer_in_bwd` must be False !!!
+optimizer_in_bwd: False
+compile: False
+lr_scheduler:
+  _component_: torchtune.modules.get_cosine_schedule_with_warmup
+  num_warmup_steps: 300
+# NOTE, label loss would be disable when `distillation_mode=True`
+label_loss_ratio: 0.
+mod_model_settings:
+  # exp_tag ['random', 'sim_score', 'attn_map', 'position', 'hybrid_feats']
+  enable: True
+  exp_tag: hybrid_feats
+  guide_loss_warmup_ratio: 0.5
+  guide_loss_base_alpha: 0.8
+  prefix_num: 1
+  postfix_num: 1
+
+  # NOTE sr: 0.35
+  # token_capacity:
+  #   layer_16: 0.52236817
+  #   layer_17: 0.42426
+  #   layer_18: 0.36633
+  #   layer_19: 0.3188481
+  #   layer_20: 0.320935
+  #   layer_21: 0.23691823
+  #   layer_22: 0.22439392
+  #   layer_23: 0.18786
+  #   layer_24: 0.1701
+  #   layer_25: 0.14298
+  #   layer_26: 0.15759
+  #   layer_27: 0.14142035
+  #   layer_28: 0.150813
+  #   layer_29: 0.16020682
+  #   layer_30: 0.284928
+  # NOTE sr: 0.4
+  token_capacity:
+    layer_1: 1.0
+    layer_2: 1.0
+    layer_3: 1.0
+    layer_4: 1.0
+    layer_5: 1.0
+    layer_6: 1.0
+    layer_7: 1.0
+    layer_8: 0.8088
+    layer_9: 0.7754
+    layer_10: 0.7293
+    layer_11: 0.6505
+    layer_12: 0.6453
+    layer_13: 0.6517
+    layer_14: 0.6364
+    layer_15: 0.6357
+    layer_16: 0.6415
+    layer_17: 0.5210
+    layer_18: 0.4499
+    layer_19: 0.3916
+    layer_20: 0.3941
+    layer_21: 0.2909
+    layer_22: 0.2756
+    layer_23: 0.2307
+    layer_24: 0.2089
+    layer_25: 0.1756
+    layer_26: 0.1935
+    layer_27: 0.1737
+    layer_28: 0.1852
+    layer_29: 0.1967
+    layer_30: 0.3499
+
+  # # NOTE sr: 0.3
+  # token_capacity:
+  #   layer_16: 0.7403
+  #   layer_17: 0.6013
+  #   layer_18: 0.5192
+  #   layer_19: 0.4519
+  #   layer_20: 0.4548
+  #   layer_21: 0.3357
+  #   layer_22: 0.3180
+  #   layer_23: 0.2662
+  #   layer_24: 0.2411
+  #   layer_25: 0.2026
+  #   layer_26: 0.2233
+  #   layer_27: 0.2043
+  #   layer_28: 0.2137
+  #   layer_29: 0.2270
+  #   layer_30: 0.4038
+
+# Others.
+device: cuda
+seed: null
+native_llama_path: /home/yifei/zkli/MoD/llama/7b-hf
+codes_copy_backup:
+  enable: True
+  _code_src_path: ./torchtune/modules/mod_transformer.py
+  _cfg_src_path: ./configs/llama2_7B/7B_llama2_router_mod.yaml
+
+# Dataset
+dataset:
+  _component_: torchtune.datasets.alpaca_local_dataset
+  data_files: /home/yifei/zkli/MoD/LLaMA-Factory/data/alpaca_gpt4_data_en.json
+shuffle: False
+
+# Tokenizer
+tokenizer:
+  _component_: torchtune.models.llama2.llama2_tokenizer
+  path: ${native_llama_path}/tokenizer.model
+
+# Logging
+metric_logger:
+  _component_: torchtune.utils.metric_logging.DiskLogger
+  log_dir: ./exps/${exp_name}/logs
+output_dir: ./exps/${exp_name}
+log_every_n_steps: 1
+log_peak_memory_stats: False
+
+# Model Arguments
+model:
+  _component_: torchtune.models.llama2.llama2_7b_mod
+checkpointer:
+  _component_: torchtune.utils.FullModelHFCheckpointer
+  checkpoint_dir: ${native_llama_path}
+  checkpoint_files: [
+    pytorch_model-00001-of-00003.bin,
+    pytorch_model-00002-of-00003.bin,
+    pytorch_model-00003-of-00003.bin
+  ]
+  adapter_checkpoint: null
+  recipe_checkpoint: null
+  output_dir: ./exps/${exp_name}/weights
+  model_type: LLAMA2
+resume_from_checkpoint: False
+
+# Memory management
+enable_activation_checkpointing: True
+memory_efficient_fsdp_wrap: False
+
+# Reduced precision
+dtype: fp32
+
+
