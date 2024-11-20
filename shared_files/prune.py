@@ -1,0 +1,649 @@
+import time 
+import heapq 
+import torch 
+import torch.nn as nn 
+import torch.optim as optim 
+import numpy as np
+from .sparsegpt import SparseGPT 
+from .layerwrapper import WrappedGPT
+from .data import get_loaders 
+from scipy.optimize import linear_sum_assignment
+
+from .ablate import AblateGPT 
+
+def find_layers(module, layers=[nn.Linear], name=''):
+    """
+    Recursively find the layers of a certain type in a module.
+
+    Args:
+        module (nn.Module): PyTorch module.
+        layers (list): List of layer types to find.
+        name (str): Name of the module.
+
+    Returns:
+        dict: Dictionary of layers of the given type(s) within the module.
+    """
+    if type(module) in layers:
+        return {name: module}
+    res = {}
+    for name1, child in module.named_children():
+        res.update(find_layers(
+            child, layers=layers, name=name + '.' + name1 if name != '' else name1
+        ))
+    return res
+
+def check_sparsity(model):
+    use_cache = model.config.use_cache 
+    model.config.use_cache = False 
+
+    layers = model.model.layers
+    count = 0 
+    total_params = 0
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        sub_count = 0
+        sub_params = 0
+        for name in subset:
+            W = subset[name].weight.data
+            count += (W==0).sum().item()
+            total_params += W.numel()
+
+            sub_count += (W==0).sum().item()
+            sub_params += W.numel()
+
+        print(f"layer {i} sparsity {float(sub_count)/sub_params:.6f}")
+
+    model.config.use_cache = use_cache 
+    return float(count)/total_params 
+
+def prepare_calibration_input(model, dataloader, device):
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.layers
+
+    # dev = model.hf_device_map["model.embed_tokens"]
+    if "model.embed_tokens" in model.hf_device_map:
+        device = model.hf_device_map["model.embed_tokens"]
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
+    inps.requires_grad = False
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            cache['attention_mask'] = kwargs['attention_mask']
+            cache['position_ids'] = kwargs['position_ids']
+            raise ValueError
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(device))
+        except ValueError:
+            pass 
+    layers[0] = layers[0].module
+
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
+    model.config.use_cache = use_cache
+
+    return inps, outs, attention_mask, position_ids 
+
+def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
+    thres_cumsum = sum_before * alpha 
+    sort_mask = tmp_metric <= thres_cumsum.reshape((-1,1))
+    thres = torch.gather(sort_res[0], dim=1, index=sort_mask.sum(dim=1, keepdims=True)-1)
+    W_mask = (W_metric <= thres)
+    cur_sparsity = (W_mask==True).sum() / W_mask.numel()
+    return W_mask, cur_sparsity
+
+def prune_magnitude(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    layers = model.model.layers 
+
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        for name in subset:
+            W = subset[name].weight.data 
+            W_metric = torch.abs(W)
+            if prune_n != 0:
+                W_mask = (torch.zeros_like(W)==1)
+                for ii in range(W_metric.shape[1]):
+                    if ii % prune_m == 0:
+                        tmp = W_metric[:,ii:(ii+prune_m)].float()
+                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+            else:
+                thresh = torch.sort(W_metric.flatten().cuda())[0][int(W.numel()*args.sparsity_ratio)].cpu()
+                W_mask = (W_metric<=thresh)
+
+            W[W_mask] = 0
+            
+def gumbel_sinkhorn(log_alpha, n_iters, tau, noise_factor=1.0, epsilon=1e-8):
+    # Sample Gumbel noise
+    gumbel_noise = -torch.log(-torch.log(torch.rand_like(log_alpha) + epsilon) + epsilon)
+    # Add noise to the logits
+    noisy_logits = (log_alpha + noise_factor * gumbel_noise) / tau
+    # Initialize the permutation matrix
+    S = torch.exp(noisy_logits)
+    for _ in range(n_iters):
+        # Row normalization
+        S = S / (S.sum(dim=1, keepdim=True) + epsilon)
+        # Column normalization
+        S = S / (S.sum(dim=0, keepdim=True) + epsilon)
+    return S
+
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    use_cache = model.config.use_cache 
+    model.config.use_cache = False 
+
+    print("loading calibdation data")
+    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+    print("dataset loading complete")
+    with torch.no_grad():
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+
+    layers = model.model.layers
+    # -----------------------------------------------------------
+    # Permutation parameters
+    num_epochs = 1000  # Set the number of training epochs
+    learning_rate = 0.2  # Learning rate for optimizer
+    tau = 0.5  # Temperature parameter for Gumbel-Sinkhorn
+    sinkhorn_iterations = 10  # Number of Sinkhorn iterations
+    epsilon = 1e-8  # Small epsilon to prevent numerical issues
+    
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+
+        wrapped_layers = {}
+        for name in subset:
+            if "proj" in name:
+                wrapped_layers[name] = WrappedGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+            
+        
+        # Example of correct computation
+        outputs_before_pruning = []
+        for j in range(args.nsamples):
+            output = layer(
+                inps[j].unsqueeze(0),
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+            )[0]
+            outputs_before_pruning.append(output)
+
+        outputs_before_pruning = torch.stack(outputs_before_pruning)
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+                #outputs_before_pruning[j] = layer(inps[j].unsqueeze(0),attention_mask=attention_mask,position_ids=position_ids,)[0]
+        for h in handles:
+            h.remove()
+
+
+        # Store the original weights to restore later
+        original_weights = {}
+        for name in subset:
+            if "proj" in name:
+                original_weights[name] = subset[name].weight.data.clone()
+            
+        # Initialize learnable logits M for each module in the subset
+        M_dict = {}
+        for name in subset:
+            if "proj" in name:
+                print(name)
+                W = subset[name].weight.data  # Shape: [output_dim, input_dim]
+                num_cols = W.shape[1]
+                M_dict[name] = nn.Parameter(torch.zeros(num_cols, num_cols, device=device))
+        optimizer = optim.Adam(M_dict.values(), lr=learning_rate)
+        
+        for epoch in range(num_epochs):
+            optimizer.zero_grad()
+            original_weights = {}
+            for name in subset:
+                original_weights[name] = subset[name].weight.data.clone()
+            # Dictionary to store permuted and pruned weights and masks
+            W_perm_dict = {}
+            W_pruned_dict = {}
+            W_mask_dict = {}
+            initial_M = M_dict['mlp.up_proj'].clone().detach()
+            # Step 1: Compute permutations and apply pruning for each module
+            for name in subset:
+                if "proj" in name:
+                    W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+                    
+                    W = subset[name].weight.data
+                    num_cols = W.shape[1]
+                    M = M_dict[name]
+                    
+                    S_soft = gumbel_sinkhorn(M, sinkhorn_iterations, tau, epsilon=epsilon)
+
+                    # Step 2: Compute the hard permutation matrix P_hard
+                    with torch.no_grad():
+                        S_cpu = S_soft.detach().cpu().numpy()
+                        row_ind, col_ind = linear_sum_assignment(-S_cpu)
+                        P_hard = torch.zeros_like(S_soft)
+                        P_hard[row_ind, col_ind] = 1.0
+
+                    # Modify P_hard to allow gradient flow
+                    P_hard = (P_hard - S_soft).detach() + S_soft
+
+                    P_hard = P_hard.to(W.dtype)
+                    
+                    # Permute the columns of W using P_hard
+                    W_perm = torch.matmul(W, P_hard)
+                    print(f"W_perm.requires_grad: {W_perm.requires_grad}") 
+                    W_metric = W_metric.to(torch.float16)
+                    W_metric_perm = torch.matmul(W_metric, P_hard)
+                    W_mask = (torch.zeros_like(W_metric_perm) == 1)
+                    for ii in range(0, W_metric_perm.shape[1], prune_m):
+                        tmp = W_metric_perm[:, ii:(ii + prune_m)].float()
+                        _, indices = torch.topk(tmp, prune_n, dim=1, largest=False)
+                        W_mask[:, ii:(ii + prune_m)].scatter_(1, indices, True)
+                    # Apply the pruning mask to the permuted W
+                    W_pruned_perm = W_perm.clone()
+                    W_pruned_perm[W_mask] = 0
+                    # Map the permuted and pruned weights back to the original order
+                    # Compute the inverse permutation
+                    inv_perm = torch.argsort(torch.tensor(col_ind)).to(device)
+                    # Map W_pruned_perm back to original order
+                    W_pruned = torch.matmul(W_pruned_perm, P_hard.t())
+                    # Store pruned weights
+                    W_pruned_dict[name] = W_pruned
+
+                    # Update the weights in the model with pruned weights
+                    with torch.no_grad():
+                        subset[name].weight.copy_(W_pruned)
+
+            # Forward pass after pruning with permutation
+            outputs_with_perm = []  # Use a list instead of a preallocated tensor
+            for j in range(args.nsamples):
+                output = layer(inps[j].unsqueeze(0),attention_mask=attention_mask,position_ids=position_ids,)[0]
+                outputs_with_perm.append(output)
+            # Stack outputs into a single tensor
+            outputs_with_perm = torch.stack(outputs_with_perm)  # Shape: [nsamples, ...]
+            
+            outputs_with_perm.requires_grad_(True)  # Ensure outputs_with_perm is in the graph
+            outputs_with_perm.register_hook(lambda grad: print("Gradient for outputs_with_perm:", grad))
+            S_soft.register_hook(lambda grad: print(f"Gradient for S_soft: {grad}"))
+            M.register_hook(lambda grad: print(f"Gradient for M: {grad}"))
+            # Check gradients systematically
+            print("Checking gradient flow...")
+            print("Gradient from S_soft to M:", torch.autograd.grad(S_soft.sum(), M, retain_graph=True, allow_unused=True))
+            print("Gradient from P_hard to S_soft:", torch.autograd.grad(P_hard.sum(), S_soft, retain_graph=True, allow_unused=True))
+            print("Gradient from W_perm to P_hard:", torch.autograd.grad(W_perm.sum(), P_hard, retain_graph=True, allow_unused=True))
+            print("Gradient from outputs_with_perm to W_perm:", torch.autograd.grad(outputs_with_perm.sum(), W_perm, retain_graph=True, allow_unused=True))
+
+            # Verify gradient through differences_norm_with_perm
+            differences_norm_with_perm = []
+            for j in range(args.nsamples):
+                diff_norm = torch.norm(outputs_with_perm[j] - outputs_before_pruning[j])
+                differences_norm_with_perm.append(diff_norm)
+
+            # Stack into a tensor
+            differences_norm_with_perm = torch.stack(differences_norm_with_perm)
+            differences_norm_with_perm.requires_grad_(True)
+            differences_norm_with_perm.register_hook(lambda grad: print("Gradient for differences_norm_with_perm:", grad))
+            outputs_before_pruning.requires_grad_(True)
+            print(f"outputs_with_perm depends on M: {torch.autograd.grad(outputs_with_perm.sum(), M, retain_graph=True, allow_unused=True)}")
+            
+
+            # Compute loss
+            loss = torch.mean(differences_norm_with_perm)
+            #loss = M.sum()
+            print(f"Loss.requires_grad: {loss.requires_grad}")  # Should be True
+            test_loss = outputs_with_perm.sum()
+            print(torch.autograd.grad(test_loss, W_perm, retain_graph=True, allow_unused=True))
+            
+            print(f'Layer {i}, Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.6f}')
+            loss.backward(retain_graph=True)
+
+            # Check gradients
+            for name in M_dict:
+                grad_norm = M_dict[name].grad.norm().item() if M_dict[name].grad is not None else None
+                print(f'Permutation parameter {name}, Gradient Norm: {grad_norm}')
+            final_M = M_dict['mlp.up_proj'].clone().detach()
+            difference = torch.norm(final_M - initial_M)
+            print(f'Total change in permutation weights: {difference.item()}')
+            optimizer.step()
+            # Zero the gradients
+            optimizer.zero_grad()
+            #print(f'Epoch {epoch + 1}, permutation logits (first 5 elements): {M.view(-1)[:5]}')
+            # Restore original weights
+            for name in subset:
+                subset[name].weight.data = original_weights[name].clone()
+            
+
+
+                
+        # -------------------------------------------------------------------------------------------------------------------------    
+        # Step 1: Pruning without permutation
+        for name in subset:
+            print(f"Pruning layer {i} name {name} without permutation")
+            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+
+            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            if prune_n != 0:
+                # structured n:m sparsity
+                for ii in range(W_metric.shape[1]):
+                    if ii % prune_m == 0:
+                        tmp = W_metric[:,ii:(ii+prune_m)].float()
+                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+
+            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+        outputs_after_pruning_no_perm = torch.zeros_like(outs)
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outputs_after_pruning_no_perm[j] = layer(inps[j].unsqueeze(0),attention_mask=attention_mask,position_ids=position_ids,)[0]
+        differences_norm_no_perm = []
+        for j in range(args.nsamples):
+            diff_norm = torch.norm(outputs_after_pruning_no_perm[j] - outputs_before_pruning[j])
+            differences_norm_no_perm.append(diff_norm.item())
+            
+        # Restore original weights before permutation
+        for name in subset:
+            subset[name].weight.data = original_weights[name].clone()
+        # -------------------------------------------------------------------------------------------------------------------------    
+        # Step 2: Pruning with permutation
+        for name in subset:
+            
+            print(f"Pruning layer {i} name {name} with permutation")
+            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(
+                wrapped_layers[name].scaler_row.reshape((1, -1))
+            )
+            if prune_n != 0:
+                # Assign importance score to each column
+                # For simplicity, let's assume importance_score is 'sum'
+                sorted_idx = torch.sort(torch.sum(W_metric, dim=0))[1]
+
+                # Channel reallocation (permutation)
+                index = torch.zeros_like(sorted_idx)
+                for ii in range(1, prune_m + 1):
+                    if ii % 2 == 1:
+                        index[
+                            ii - 1 :: prune_m
+                        ] = sorted_idx[
+                            int(W_metric.shape[1] * (ii - 1) / prune_m) : int(
+                                W_metric.shape[1] * ii / prune_m
+                            )
+                        ]
+                    else:
+                        index[
+                            ii - 1 :: prune_m
+                        ] = sorted_idx[
+                            int(W_metric.shape[1] * (ii - 1) / prune_m) : int(
+                                W_metric.shape[1] * ii / prune_m
+                            )
+                        ].flip(0)
+
+                # Permute the weights
+                W = subset[name].weight.data
+                W_permuted = W[:, index]
+                # Apply pruning on the permuted weights
+                W_metric_resort = W_metric[:, index]
+                W_mask_permute = torch.zeros_like(W_metric_resort).bool()
+                for ii in range(0, W_metric_resort.shape[1], prune_m):
+                    tmp = W_metric_resort[:, ii:(ii + prune_m)].float()
+                    _, indices = torch.topk(tmp, prune_n, dim=1, largest=False)
+                    W_mask_permute[:, ii:(ii + prune_m)].scatter_(1, indices, True)
+
+                # Apply the pruning mask to the permuted weights
+                W_permuted[W_mask_permute] = 0
+
+                # Map the permuted and pruned weights back to the original order
+                inv_index = torch.zeros_like(index)
+                inv_index[index] = torch.arange(len(index)).to(device)
+                W_final = W_permuted[:, inv_index]
+
+                # Update the weights in the model
+                subset[name].weight.data = W_final.clone()
+        # Forward pass after pruning with permutation
+        outputs_after_pruning_with_perm = torch.zeros_like(outs)
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outputs_after_pruning_with_perm[j] = layer(inps[j].unsqueeze(0),attention_mask=attention_mask,position_ids=position_ids,)[0]
+        # Compute difference norm with permutation
+        differences_norm_with_perm = []
+        for j in range(args.nsamples):
+            diff_norm = torch.norm(outputs_after_pruning_with_perm[j] - outputs_before_pruning[j])
+            differences_norm_with_perm.append(diff_norm.item())
+        # -------------------------------------------------------------------------------------------------------------------------  
+        print(f"Layer {i} difference norms:")
+        for j in range(args.nsamples):
+            print(
+                f"Sample {j}: Without Permutation = {differences_norm_no_perm[j]:.6f}, "
+                f"With Permutation = {differences_norm_with_perm[j]:.6f}"
+            )
+        outputs_after_pruning = torch.zeros_like(outs)
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outputs_after_pruning[j] = layer(inps[j].unsqueeze(0),attention_mask=attention_mask,position_ids=position_ids,)[0]
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        inps, outs = outs, inps
+        
+        # differences_norm = []
+        # for j in range(args.nsamples):
+        #     # print(outputs_before_pruning[j])
+        #     # print(outputs_after_pruning[j])
+        #     diff_norm = torch.norm(outputs_after_pruning[j] - outputs_before_pruning[j])
+        #     differences_norm.append(diff_norm.item())
+
+        # print(f"Differences for layer {i}:")
+        # for j in range(args.nsamples):
+        #     print(f"Sample {j}: Difference Norm = {differences_norm[j]}")
+            
+        break
+
+    
+    model.config.use_cache = use_cache 
+    torch.cuda.empty_cache()
+
+
+@torch.no_grad()
+def prune_sparsegpt(args, model, tokenizer, dev, prune_n=0, prune_m=0):
+    ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
+    print('Starting ...')
+    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.layers
+
+    if "model.embed_tokens" in model.hf_device_map:
+        dev = model.hf_device_map["model.embed_tokens"]
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            cache['attention_mask'] = kwargs['attention_mask']
+            cache['position_ids'] = kwargs['position_ids']
+            raise ValueError
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+    torch.cuda.empty_cache()
+
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
+
+    print('Ready.')
+
+    for i in range(len(layers)):
+        layer = layers[i]
+        if f"model.layers.{i}" in model.hf_device_map:
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            print(f"layer {i} device {dev}")
+            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+
+        subset = find_layers(layer)
+
+        gpts = {}
+        for name in subset:
+            gpts[name] = SparseGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                gpts[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in gpts:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        for h in handles:
+            h.remove()
+
+        for name in gpts:
+            print(i, name)
+            print('Pruning ...')
+
+            gpts[name].fasterprune(args.sparsity_ratio, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+            gpts[name].free()
+
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+
+        layers[i] = layer 
+        torch.cuda.empty_cache()
+
+        inps, outs = outs, inps
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
+
+
+
+@torch.no_grad()
+def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
+    ## SparseGPT code available at: https://github.com/IST-DASLab/sparsegpt/tree/f5c25005a61f96a0933ca2f95705a963585aafaa
+    print('Starting ...')
+    dataloader, _ = get_loaders("c4",nsamples=args.nsamples,seed=args.seed,seqlen=model.seqlen,tokenizer=tokenizer)
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.layers
+
+    if "model.embed_tokens" in model.hf_device_map:
+        dev = model.hf_device_map["model.embed_tokens"]
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros(
+        (args.nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            cache['attention_mask'] = kwargs['attention_mask']
+            cache['position_ids'] = kwargs['position_ids']
+            raise ValueError
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(dev))
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+    torch.cuda.empty_cache()
+
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
+
+    print('Ready.')
+
+    for i in range(len(layers)):
+        layer = layers[i]
+        if f"model.layers.{i}" in model.hf_device_map:
+            dev = model.hf_device_map[f"model.layers.{i}"]
+            print(f"layer {i} device {dev}")
+            inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
+
+        subset = find_layers(layer)
+
+        gpts = {}
+        for name in subset:
+            gpts[name] = AblateGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                gpts[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in gpts:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        for h in handles:
+            h.remove()
+
+        for name in gpts:
+            print(i, name)
+            print('Pruning ...')
+
+            if args.prune_method == "ablate_wanda_seq":
+                prune_mask = gpts[name].get_wanda_mask(args.sparsity_ratio, prune_n, prune_m)
+            elif args.prune_method == "ablate_mag_seq":
+                prune_mask = gpts[name].get_mag_mask(args.sparsity_ratio, prune_n, prune_m)
+            elif "iter" in args.prune_method:
+                prune_mask = None 
+
+            gpts[name].fasterprune(args, args.sparsity_ratio, mask=prune_mask, prune_n=prune_n, prune_m=prune_m, percdamp=0.01, blocksize=128)
+            gpts[name].free()
+
+        for j in range(args.nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+
+        layers[i] = layer 
+        torch.cuda.empty_cache()
+
+        inps, outs = outs, inps
+
+    model.config.use_cache = use_cache
+    torch.cuda.empty_cache()
