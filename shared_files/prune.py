@@ -155,14 +155,15 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     # -----------------------------------------------------------
     # Permutation parameters
     num_epochs = 1000  # Set the number of training epochs
-    learning_rate = 0.2  # Learning rate for optimizer
-    tau = 0.5  # Temperature parameter for Gumbel-Sinkhorn
-    sinkhorn_iterations = 10  # Number of Sinkhorn iterations
+    learning_rate = 0.5  # Learning rate for optimizer
+    tau = 3  # Temperature parameter for Gumbel-Sinkhorn
+    sinkhorn_iterations = 30  # Number of Sinkhorn iterations
     epsilon = 1e-8  # Small epsilon to prevent numerical issues
     
     for i in range(len(layers)):
         layer = layers[i]
         subset = find_layers(layer)
+        print(subset)
 
         if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
             dev = model.hf_device_map[f"model.layers.{i}"]
@@ -170,7 +171,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
 
         wrapped_layers = {}
         for name in subset:
-            if "proj" in name:
+            if "self" in name:
                 wrapped_layers[name] = WrappedGPT(subset[name])
 
         def add_batch(name):
@@ -206,18 +207,30 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         # Store the original weights to restore later
         original_weights = {}
         for name in subset:
-            if "proj" in name:
+            if "self" in name:
                 original_weights[name] = subset[name].weight.data.clone()
             
         # Initialize learnable logits M for each module in the subset
+        rank = 50
         M_dict = {}
+        U_dict = {}
+        V_dict = {}
         for name in subset:
-            if "proj" in name:
+            if "self" in name:
                 print(name)
                 W = subset[name].weight.data  # Shape: [output_dim, input_dim]
                 num_cols = W.shape[1]
                 M_dict[name] = nn.Parameter(torch.zeros(num_cols, num_cols, device=device))
+                
+                # U_dict[name] = nn.Parameter(torch.randn(num_cols, 50, device=device) * 0.01)
+                # V_dict[name] = nn.Parameter(torch.randn(50, num_cols, device=device) * 0.01)
+
         optimizer = optim.Adam(M_dict.values(), lr=learning_rate)
+        # Assuming U_dict, V_dict, and M_dict all contain nn.Parameter objects
+        # params_to_optimize = list(U_dict.values()) + list(V_dict.values()) + list(M_dict.values())
+        # optimizer = optim.Adam(params_to_optimize, lr=learning_rate)
+
+        
         
         for epoch in range(num_epochs):
             optimizer.zero_grad()
@@ -228,21 +241,31 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             W_perm_dict = {}
             W_pruned_dict = {}
             W_mask_dict = {}
-            initial_M = M_dict['mlp.up_proj'].clone().detach()
+            #initial_M = M_dict['mlp.up_proj'].clone().detach()
+            
+            total_preserved_metric = 0.0
             # Step 1: Compute permutations and apply pruning for each module
             for name in subset:
-                if "proj" in name:
+                if "self" in name:
                     W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
                     
                     W = subset[name].weight.data
                     num_cols = W.shape[1]
+                    # U = U_dict[name]
+                    # V = V_dict[name]
+                    
+                    # M = torch.matmul(U, V)
                     M = M_dict[name]
                     
                     S_soft = gumbel_sinkhorn(M, sinkhorn_iterations, tau, epsilon=epsilon)
-
+                    S_soft = torch.clamp(S_soft, min=1e-8, max=1 - 1e-8)
                     # Step 2: Compute the hard permutation matrix P_hard
                     with torch.no_grad():
                         S_cpu = S_soft.detach().cpu().numpy()
+                        if not np.isfinite(S_cpu).all():
+                            print("Invalid values in S_cpu")
+                            print(S_cpu)
+                            exit()
                         row_ind, col_ind = linear_sum_assignment(-S_cpu)
                         P_hard = torch.zeros_like(S_soft)
                         P_hard[row_ind, col_ind] = 1.0
@@ -254,7 +277,7 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                     
                     # Permute the columns of W using P_hard
                     W_perm = torch.matmul(W, P_hard)
-                    print(f"W_perm.requires_grad: {W_perm.requires_grad}") 
+                    #print(f"W_perm.requires_grad: {W_perm.requires_grad}") 
                     W_metric = W_metric.to(torch.float16)
                     W_metric_perm = torch.matmul(W_metric, P_hard)
                     W_mask = (torch.zeros_like(W_metric_perm) == 1)
@@ -263,6 +286,13 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                         _, indices = torch.topk(tmp, prune_n, dim=1, largest=False)
                         W_mask[:, ii:(ii + prune_m)].scatter_(1, indices, True)
                     # Apply the pruning mask to the permuted W
+                    # Apply pruning mask
+                    W_metric_preserved = W_metric_perm.clone()
+                    W_metric_preserved[W_mask] = 0
+                    W_metric_preserved = W_metric_preserved.to(torch.float32)  # Ensure precision
+                    total_preserved_metric += W_metric_preserved.sum()
+                    #print(W_metric_preserved)
+                    
                     W_pruned_perm = W_perm.clone()
                     W_pruned_perm[W_mask] = 0
                     # Map the permuted and pruned weights back to the original order
@@ -274,8 +304,8 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                     W_pruned_dict[name] = W_pruned
 
                     # Update the weights in the model with pruned weights
-                    with torch.no_grad():
-                        subset[name].weight.copy_(W_pruned)
+                    subset[name].weight.data = W_pruned.clone()
+
 
             # Forward pass after pruning with permutation
             outputs_with_perm = []  # Use a list instead of a preallocated tensor
@@ -286,15 +316,15 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             outputs_with_perm = torch.stack(outputs_with_perm)  # Shape: [nsamples, ...]
             
             outputs_with_perm.requires_grad_(True)  # Ensure outputs_with_perm is in the graph
-            outputs_with_perm.register_hook(lambda grad: print("Gradient for outputs_with_perm:", grad))
-            S_soft.register_hook(lambda grad: print(f"Gradient for S_soft: {grad}"))
-            M.register_hook(lambda grad: print(f"Gradient for M: {grad}"))
+            #outputs_with_perm.register_hook(lambda grad: print("Gradient for outputs_with_perm:", grad))
+            #S_soft.register_hook(lambda grad: print(f"Gradient for S_soft: {grad}"))
+            #M.register_hook(lambda grad: print(f"Gradient for M: {grad}"))
             # Check gradients systematically
-            print("Checking gradient flow...")
-            print("Gradient from S_soft to M:", torch.autograd.grad(S_soft.sum(), M, retain_graph=True, allow_unused=True))
-            print("Gradient from P_hard to S_soft:", torch.autograd.grad(P_hard.sum(), S_soft, retain_graph=True, allow_unused=True))
-            print("Gradient from W_perm to P_hard:", torch.autograd.grad(W_perm.sum(), P_hard, retain_graph=True, allow_unused=True))
-            print("Gradient from outputs_with_perm to W_perm:", torch.autograd.grad(outputs_with_perm.sum(), W_perm, retain_graph=True, allow_unused=True))
+            # print("Checking gradient flow...")
+            # print("Gradient from S_soft to M:", torch.autograd.grad(S_soft.sum(), M, retain_graph=True, allow_unused=True))
+            # print("Gradient from P_hard to S_soft:", torch.autograd.grad(P_hard.sum(), S_soft, retain_graph=True, allow_unused=True))
+            # print("Gradient from W_perm to P_hard:", torch.autograd.grad(W_perm.sum(), P_hard, retain_graph=True, allow_unused=True))
+            # print("Gradient from outputs_with_perm to W_perm:", torch.autograd.grad(outputs_with_perm.sum(), W_perm, retain_graph=True, allow_unused=True))
 
             # Verify gradient through differences_norm_with_perm
             differences_norm_with_perm = []
@@ -305,17 +335,18 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             # Stack into a tensor
             differences_norm_with_perm = torch.stack(differences_norm_with_perm)
             differences_norm_with_perm.requires_grad_(True)
-            differences_norm_with_perm.register_hook(lambda grad: print("Gradient for differences_norm_with_perm:", grad))
+            #differences_norm_with_perm.register_hook(lambda grad: print("Gradient for differences_norm_with_perm:", grad))
             outputs_before_pruning.requires_grad_(True)
             print(f"outputs_with_perm depends on M: {torch.autograd.grad(outputs_with_perm.sum(), M, retain_graph=True, allow_unused=True)}")
             
 
             # Compute loss
             loss = torch.mean(differences_norm_with_perm)
+            print(f'Diff: {loss}')
+            loss = -total_preserved_metric
             #loss = M.sum()
-            print(f"Loss.requires_grad: {loss.requires_grad}")  # Should be True
-            test_loss = outputs_with_perm.sum()
-            print(torch.autograd.grad(test_loss, W_perm, retain_graph=True, allow_unused=True))
+            #print(f"Loss.requires_grad: {loss.requires_grad}")  # Should be True
+            
             
             print(f'Layer {i}, Epoch [{epoch + 1}/{num_epochs}], Loss: {loss.item():.6f}')
             loss.backward(retain_graph=True)
@@ -324,9 +355,19 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             for name in M_dict:
                 grad_norm = M_dict[name].grad.norm().item() if M_dict[name].grad is not None else None
                 print(f'Permutation parameter {name}, Gradient Norm: {grad_norm}')
-            final_M = M_dict['mlp.up_proj'].clone().detach()
-            difference = torch.norm(final_M - initial_M)
-            print(f'Total change in permutation weights: {difference.item()}')
+            # for name in M_dict:
+            #     # For each layer in M_dict, access both U and V
+            #     U_grad_norm = M_dict[name]['U'].grad.norm().item() if M_dict[name]['U'].grad is not None else None
+            #     V_grad_norm = M_dict[name]['V'].grad.norm().item() if M_dict[name]['V'].grad is not None else None
+                
+            #     # Print the gradient norms for both U and V
+            #     print(f'Layer {name}:')
+            #     print(f'  U Gradient Norm: {U_grad_norm}')
+            #     print(f'  V Gradient Norm: {V_grad_norm}')
+
+            #final_M = M_dict['mlp.up_proj'].clone().detach()
+            #difference = torch.norm(final_M - initial_M)
+            #print(f'Total change in permutation weights: {difference.item()}')
             optimizer.step()
             # Zero the gradients
             optimizer.zero_grad()
@@ -341,18 +382,19 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         # -------------------------------------------------------------------------------------------------------------------------    
         # Step 1: Pruning without permutation
         for name in subset:
-            print(f"Pruning layer {i} name {name} without permutation")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+            if "self" in name:
+                print(f"Pruning layer {i} name {name} without permutation")
+                W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
 
-            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
-            if prune_n != 0:
-                # structured n:m sparsity
-                for ii in range(W_metric.shape[1]):
-                    if ii % prune_m == 0:
-                        tmp = W_metric[:,ii:(ii+prune_m)].float()
-                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+                W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+                if prune_n != 0:
+                    # structured n:m sparsity
+                    for ii in range(W_metric.shape[1]):
+                        if ii % prune_m == 0:
+                            tmp = W_metric[:,ii:(ii+prune_m)].float()
+                            W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
+                subset[name].weight.data[W_mask] = 0  ## set weights to zero 
         outputs_after_pruning_no_perm = torch.zeros_like(outs)
         for j in range(args.nsamples):
             with torch.no_grad():
@@ -364,61 +406,62 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
             
         # Restore original weights before permutation
         for name in subset:
-            subset[name].weight.data = original_weights[name].clone()
+            if "self" in name:
+                subset[name].weight.data = original_weights[name].clone()
         # -------------------------------------------------------------------------------------------------------------------------    
         # Step 2: Pruning with permutation
         for name in subset:
-            
-            print(f"Pruning layer {i} name {name} with permutation")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(
-                wrapped_layers[name].scaler_row.reshape((1, -1))
-            )
-            if prune_n != 0:
-                # Assign importance score to each column
-                # For simplicity, let's assume importance_score is 'sum'
-                sorted_idx = torch.sort(torch.sum(W_metric, dim=0))[1]
+            if "self" in name:
+                print(f"Pruning layer {i} name {name} with permutation")
+                W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(
+                    wrapped_layers[name].scaler_row.reshape((1, -1))
+                )
+                if prune_n != 0:
+                    # Assign importance score to each column
+                    # For simplicity, let's assume importance_score is 'sum'
+                    sorted_idx = torch.sort(torch.sum(W_metric, dim=0))[1]
 
-                # Channel reallocation (permutation)
-                index = torch.zeros_like(sorted_idx)
-                for ii in range(1, prune_m + 1):
-                    if ii % 2 == 1:
-                        index[
-                            ii - 1 :: prune_m
-                        ] = sorted_idx[
-                            int(W_metric.shape[1] * (ii - 1) / prune_m) : int(
-                                W_metric.shape[1] * ii / prune_m
-                            )
-                        ]
-                    else:
-                        index[
-                            ii - 1 :: prune_m
-                        ] = sorted_idx[
-                            int(W_metric.shape[1] * (ii - 1) / prune_m) : int(
-                                W_metric.shape[1] * ii / prune_m
-                            )
-                        ].flip(0)
+                    # Channel reallocation (permutation)
+                    index = torch.zeros_like(sorted_idx)
+                    for ii in range(1, prune_m + 1):
+                        if ii % 2 == 1:
+                            index[
+                                ii - 1 :: prune_m
+                            ] = sorted_idx[
+                                int(W_metric.shape[1] * (ii - 1) / prune_m) : int(
+                                    W_metric.shape[1] * ii / prune_m
+                                )
+                            ]
+                        else:
+                            index[
+                                ii - 1 :: prune_m
+                            ] = sorted_idx[
+                                int(W_metric.shape[1] * (ii - 1) / prune_m) : int(
+                                    W_metric.shape[1] * ii / prune_m
+                                )
+                            ].flip(0)
 
-                # Permute the weights
-                W = subset[name].weight.data
-                W_permuted = W[:, index]
-                # Apply pruning on the permuted weights
-                W_metric_resort = W_metric[:, index]
-                W_mask_permute = torch.zeros_like(W_metric_resort).bool()
-                for ii in range(0, W_metric_resort.shape[1], prune_m):
-                    tmp = W_metric_resort[:, ii:(ii + prune_m)].float()
-                    _, indices = torch.topk(tmp, prune_n, dim=1, largest=False)
-                    W_mask_permute[:, ii:(ii + prune_m)].scatter_(1, indices, True)
+                    # Permute the weights
+                    W = subset[name].weight.data
+                    W_permuted = W[:, index]
+                    # Apply pruning on the permuted weights
+                    W_metric_resort = W_metric[:, index]
+                    W_mask_permute = torch.zeros_like(W_metric_resort).bool()
+                    for ii in range(0, W_metric_resort.shape[1], prune_m):
+                        tmp = W_metric_resort[:, ii:(ii + prune_m)].float()
+                        _, indices = torch.topk(tmp, prune_n, dim=1, largest=False)
+                        W_mask_permute[:, ii:(ii + prune_m)].scatter_(1, indices, True)
 
-                # Apply the pruning mask to the permuted weights
-                W_permuted[W_mask_permute] = 0
+                    # Apply the pruning mask to the permuted weights
+                    W_permuted[W_mask_permute] = 0
 
-                # Map the permuted and pruned weights back to the original order
-                inv_index = torch.zeros_like(index)
-                inv_index[index] = torch.arange(len(index)).to(device)
-                W_final = W_permuted[:, inv_index]
+                    # Map the permuted and pruned weights back to the original order
+                    inv_index = torch.zeros_like(index)
+                    inv_index[index] = torch.arange(len(index)).to(device)
+                    W_final = W_permuted[:, inv_index]
 
-                # Update the weights in the model
-                subset[name].weight.data = W_final.clone()
+                    # Update the weights in the model
+                    subset[name].weight.data = W_final.clone()
         # Forward pass after pruning with permutation
         outputs_after_pruning_with_perm = torch.zeros_like(outs)
         for j in range(args.nsamples):
